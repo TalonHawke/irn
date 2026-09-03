@@ -1427,7 +1427,6 @@ class GLMDriver(BaseDriver):
         await self.click_new_chat(source="auto")
         await asyncio.sleep(self._post_delay_s)
 
-        await self.apply_configured_model(model=self.current_model, wait_until_ready=True)
         await self.set_tools_state(bool(enable_tools), model_label=ui_model_label)
         await self.set_deepthink_state(
             bool(effective_deepthink),
