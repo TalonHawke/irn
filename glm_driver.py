@@ -1430,11 +1430,6 @@ class GLMDriver(BaseDriver):
         if not await self._wait_for_glm_model_selector_ready(timeout_ms=self.MODEL_SELECTOR_READY_TIMEOUT_MS):
             Logger.warning("GLM Chat: chat UI did not become ready in time after New Chat.")
         await self.set_tools_state(bool(enable_tools), model_label=ui_model_label)
-        await self.set_deepthink_state(
-            bool(effective_deepthink),
-            effort=deepthink_effort,
-            model_label=ui_model_label,
-        )
         await self.set_search_state(bool(enable_search))
         await self.set_advanced_search_state(bool(enable_advanced_search))
         await asyncio.sleep(self._post_delay_s)
