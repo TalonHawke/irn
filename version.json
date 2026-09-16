@@ -1,8 +1,8 @@
 {
-  "version": "2.9.0-update",
+  "version": "2.9.3",
   "aua": true,
-  "severity": 4,
+  "severity": 3,
   "pu": "discord",
   "pufref": "none",
-  "summary": "Anniversary update with Xiaomi MiMo, Dry Run Mode, CDP Teeing, and runtime polish"
+  "summary": "Kimi K2.8 as its own picker model, DeepSeek new radio picker, GLM modal-overlay fix"
 }

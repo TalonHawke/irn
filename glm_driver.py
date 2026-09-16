@@ -55,10 +55,10 @@ class GLMDriver(BaseDriver):
     CHAT_URL = "https://chat.z.ai/"
     AUTH_URL = "https://chat.z.ai/auth"
     CONVERSATION_URL_RE = re.compile(r"^https://chat\.z\.ai/c/([^/?#]+)", re.IGNORECASE)
-    COMPLETION_ROUTE_GLOB = "**/api/v2/chat/completions**"
-    COMPLETION_URL_PATHS = {"/api/v2/chat/completions"}
+    COMPLETION_ROUTE_GLOB = "**/api/**/chat/completions**"
+    COMPLETION_URL_PATHS = {"/api/chat/completions", "/api/v2/chat/completions"}
     MODEL_CONCURRENCY_LIMIT_CODE = "MODEL_CONCURRENCY_LIMIT"
-    GLM_52_MODEL_FRIENDLY = "GLM-5.2"
+    DEEPTHINK_EFFORT_MODEL_FRIENDLIES: frozenset[str] = frozenset({"GLM-5.2", "GLM-5.3"})
     TOOLS_SUPPORTED_MODEL_FRIENDLY = "GLM-5V-Turbo"
     DEFAULT_GLM_52_DEEPTHINK_EFFORT = "max"
     MODEL_CAPACITY_TEXT_MARKERS = (
@@ -68,6 +68,40 @@ class GLMDriver(BaseDriver):
         "switch to another model",
     )
     EMPTY_COMPLETION_STREAM_ERROR_CODE = "20001"
+    SENSITIVE_ERROR_CODE = "SENSITIVE"
+    RISK_CONTROL_BLOCKED_ERROR_CODE = "RISK_CONTROL_BLOCKED"
+    CAPTCHA_ERROR_CODES: frozenset[str] = frozenset(
+        {
+            "FRONTEND_CAPTCHA_REQUIRED",
+            "CAPTCHA_VERIFICATION_FAILED",
+            "CAPTCHA_UNAVAILABLE",
+        }
+    )
+    STREAM_ERROR_MESSAGES_BY_CODE: Dict[str, str] = {
+        SENSITIVE_ERROR_CODE: (
+            "GLM Chat's moderation flagged this prompt (code: SENSITIVE) and refused to "
+            "process it. The current chat is now blocked on GLM's side - IntenseRP will "
+            "use a fresh chat for the next request, but the prompt itself likely needs "
+            "rephrasing."
+        ),
+        RISK_CONTROL_BLOCKED_ERROR_CODE: (
+            "GLM Chat risk control temporarily blocked this account "
+            "(code: RISK_CONTROL_BLOCKED). Wait a while before retrying."
+        ),
+        "FRONTEND_CAPTCHA_REQUIRED": (
+            "GLM Chat requires manual verification (Alibaba FeiLin CAPTCHA) before this "
+            "request can proceed. Solve the CAPTCHA in the GLM Chat browser window, then "
+            "retry."
+        ),
+        "CAPTCHA_VERIFICATION_FAILED": (
+            "GLM Chat CAPTCHA verification failed. Solve the CAPTCHA in the GLM Chat "
+            "browser window and retry."
+        ),
+        "CAPTCHA_UNAVAILABLE": (
+            "GLM Chat's CAPTCHA service is currently unavailable. Wait a moment and "
+            "retry."
+        ),
+    }
 
     REFRESH_AFTER_GENERATION_DELAY_S = 2.0
     COMPLETION_REQUEST_TIMEOUT_S = 150.0
@@ -93,6 +127,8 @@ class GLMDriver(BaseDriver):
     MODEL_DROPDOWN_SELECTOR = f"div#{MODEL_DROPDOWN_ID}"
     MODEL_OPTION_SELECTOR = "button[aria-label='model-item'][data-value], div[role='menu'] button[data-value]"
     MODEL_DATA_VALUE_BY_FRIENDLY: Dict[str, str] = {
+        "GLM-5.3-Flash": "glm-5.3-flash",
+        "GLM-5.3": "glm-5.3",
         "GLM-5.2": "glm-5.2",
         "GLM-5.1": "GLM-5.1",
         "GLM-5-Turbo": "GLM-5-Turbo",
@@ -119,6 +155,7 @@ class GLMDriver(BaseDriver):
 
         self._refresh_after_generation = False
         self._refresh_after_generation_task: asyncio.Task | None = None
+        self._last_captcha_notice_ts = 0.0
 
         self._refresh_quirks()
 
@@ -301,6 +338,49 @@ class GLMDriver(BaseDriver):
             self.clean_regen_state_cache_key,
         )
 
+    async def before_initial_navigation(self) -> None:
+        if not self.context:
+            return
+
+        # Alibaba's FeiLin CAPTCHA SDK wipes the DevTools console as an
+        # anti-debug nuisance - exactly when users need to see what is
+        # happening. Neutralize console.clear() in every frame before any
+        # page script runs so logs survive a challenge.
+        try:
+            await self.context.add_init_script(
+                """
+                (() => {
+                    try {
+                        const noop = () => {};
+                        window.console.clear = noop;
+                    } catch (e) {}
+                })();
+                """
+            )
+        except Exception as e:
+            Logger.debug(f"GLM Chat: failed to install console-clear guard: {e}")
+
+        # Observe (but never block) CAPTCHA CDN traffic so IntenseRP's log shows
+        # when a verification challenge is being pulled in.
+        try:
+            await self.context.route("**/captcha-frontend/**", self._handle_captcha_resource_route)
+        except Exception as e:
+            Logger.debug(f"GLM Chat: failed to register CAPTCHA observer: {e}")
+
+    async def _handle_captcha_resource_route(self, route: Any) -> None:
+        now = time.time()
+        if (now - getattr(self, "_last_captcha_notice_ts", 0.0)) > 30.0:
+            self._last_captcha_notice_ts = now
+            Logger.warning(
+                "GLM Chat: CAPTCHA challenge resources are loading (FeiLin). "
+                "If a verification popup appears, solve it in the GLM browser window."
+            )
+
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
     async def cleanup_background_tasks(self) -> None:
         await self._cancel_task(
             self._refresh_after_generation_task,
@@ -364,9 +444,11 @@ class GLMDriver(BaseDriver):
 
     @classmethod
     def _glm_uses_deepthink_effort_controls(cls, model_friendly: str) -> bool:
-        return cls._normalize_model_label(model_friendly) == cls._normalize_model_label(
-            cls.GLM_52_MODEL_FRIENDLY
-        )
+        normalized = cls._normalize_model_label(model_friendly)
+        return normalized in {
+            cls._normalize_model_label(friendly)
+            for friendly in cls.DEEPTHINK_EFFORT_MODEL_FRIENDLIES
+        }
 
     @classmethod
     def _normalize_glm_deepthink_effort(cls, value: Any, default: str | None = None) -> str:
@@ -406,6 +488,9 @@ class GLMDriver(BaseDriver):
         if not self.page:
             return 0
 
+        total_clicked = 0
+
+        # 1. Original: buttons with data-dialog-close
         try:
             clicked = await self.page.evaluate(
                 """() => {
@@ -436,18 +521,79 @@ class GLMDriver(BaseDriver):
                     return clicked;
                 }"""
             )
+            total_clicked = int(clicked or 0)
         except Exception as e:
             Logger.debug(f"{context}: failed to dismiss data-dialog-close buttons: {e}")
-            return 0
 
+        # 2. Handle modal overlays with data-dialog-overlay (dismiss by pressing Escape)
         try:
-            clicked_count = int(clicked or 0)
-        except Exception:
-            clicked_count = 0
-        if clicked_count:
-            Logger.debug(f"{context}: dismissed {clicked_count} startup dialog close button(s).")
+            await self.page.evaluate(
+                """() => {
+                    const overlays = document.querySelectorAll('[data-dialog-overlay][data-state="open"]');
+                    for (const overlay of overlays) {
+                        // Try pressing Escape to close
+                        const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true });
+                        document.dispatchEvent(event);
+                    }
+                }"""
+            )
+        except Exception as e:
+            Logger.debug(f"{context}: failed to dismiss dialog overlays via Escape: {e}")
+
+        # 3. Handle modal overlays with close buttons that don't have data-dialog-close
+        # Try to find and click close buttons in modal overlays
+        try:
+            clicked = await self.page.evaluate(
+                """() => {
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                    };
+
+                    let clicked = 0;
+                    // Try to find close buttons in modal overlays
+                    const selectors = [
+                        'div[role="dialog"] button[aria-label*="close" i]',
+                        'div[role="dialog"] button[aria-label*="dismiss" i]',
+                        'div[data-dialog-overlay] button[aria-label*="close" i]',
+                        'div[data-dialog-overlay] button[aria-label*="dismiss" i]',
+                        'div._modal-overlay button[aria-label*="close" i]',
+                        'div._modal-overlay button[aria-label*="dismiss" i]',
+                        'div[class*="modal-overlay"] button[aria-label*="close" i]',
+                        'div[class*="modal-overlay"] button[aria-label*="dismiss" i]',
+                    ];
+                    let clicked = 0;
+                    for (const selector of selectors) {
+                        for (const button of document.querySelectorAll(selector)) {
+                            if (button.disabled || !isVisible(button)) {
+                                continue;
+                            }
+                            try {
+                                button.click();
+                                clicked += 1;
+                            } catch (e) {
+                                // Ignore
+                            }
+                        }
+                    }
+                    return clicked;
+                }"""
+            )
+            total_clicked += int(clicked or 0)
+        except Exception as e:
+            Logger.debug(f"{context}: failed to dismiss modal close buttons: {e}")
+
+        if total_clicked:
+            Logger.debug(f"{context}: dismissed {total_clicked} dialog/modal close button(s).")
             await asyncio.sleep(0.1)
-        return clicked_count
+        return total_clicked
 
     async def _read_glm_pointer_events_state(self) -> dict[str, Any]:
         """Return whether GLM's app shell is currently accepting pointer events."""
@@ -1467,7 +1613,7 @@ class GLMDriver(BaseDriver):
                 url = str(response.url or "")
             except Exception:
                 url = ""
-            if "/api/v2/chat/completions" not in url:
+            if not any(path in url for path in ("/api/chat/completions", "/api/v2/chat/completions")):
                 return False
 
             try:
@@ -1510,6 +1656,11 @@ class GLMDriver(BaseDriver):
 
         capacity_error_message = self._extract_model_capacity_error_from_text(response_text)
         if not capacity_error_message:
+            stream_error_message = self._extract_stream_error_from_text(response_text)
+            if stream_error_message:
+                Logger.warning(stream_error_message)
+                return stream_error_message
+
             if self._glm_frontend_would_see_sse_data_event(response_text):
                 return None
 
@@ -1817,6 +1968,20 @@ class GLMDriver(BaseDriver):
             return
 
         await self._dismiss_dialog_close_buttons()
+
+        # Also dismiss any modal overlays that might intercept clicks
+        try:
+            await self.page.evaluate(
+                """() => {
+                    const overlays = document.querySelectorAll('[data-dialog-overlay][data-state="open"]');
+                    for (const overlay of overlays) {
+                        const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true });
+                        document.dispatchEvent(event);
+                    }
+                }"""
+            )
+        except Exception as e:
+            Logger.debug(f"GLM Chat: failed to dismiss modal overlays via Escape: {e}")
 
         sidebar = self.page.locator("#sidebar")
         is_open = False
@@ -2824,6 +2989,107 @@ class GLMDriver(BaseDriver):
 
         return None
 
+    @classmethod
+    def _describe_stream_error(cls, code: str, detail: str) -> str:
+        friendly = cls.STREAM_ERROR_MESSAGES_BY_CODE.get(code)
+        if friendly:
+            if detail and code == cls.RISK_CONTROL_BLOCKED_ERROR_CODE:
+                return f"{friendly} (server said: {detail})"
+            return friendly
+        suffix = f" (code: {code})" if code else ""
+        if detail:
+            return f"GLM Chat returned an error{suffix}: {detail}"
+        return f"GLM Chat returned an error{suffix}."
+
+    @classmethod
+    def _extract_stream_error_parts(cls, data: Any) -> tuple[str, str] | None:
+        """Return (code, detail) for an error carried in a chat:completion payload."""
+        if not isinstance(data, dict):
+            return None
+
+        raw_error = data.get("error")
+        if not raw_error:
+            return None
+
+        if isinstance(raw_error, dict):
+            code = str(raw_error.get("code") or "").strip().upper()
+            detail = str(raw_error.get("detail") or raw_error.get("message") or "").strip()
+        else:
+            code = ""
+            detail = str(raw_error).strip()
+
+        return code, detail
+
+    @classmethod
+    def _extract_stream_error_from_data(cls, data: Any) -> str | None:
+        """Surface moderation/risk/captcha errors carried inside chat:completion frames.
+
+        GLM flags prompts with codes like SENSITIVE / RISK_CONTROL_BLOCKED /
+        FRONTEND_CAPTCHA_REQUIRED via data.error instead of streaming content.
+        Without this, the driver would report a generic empty stream and the user
+        would never learn why.
+        """
+        parts = cls._extract_stream_error_parts(data)
+        if not parts:
+            return None
+        code, detail = parts
+        return cls._describe_stream_error(code, detail)
+
+    @classmethod
+    def _extract_stream_error_from_text(cls, text: str | None) -> str | None:
+        """Extract an error from a completion body (JSON blob or SSE lines)."""
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+
+        # Whole-body JSON (HTTP-style error replay)
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            parts = cls._extract_stream_error_parts(parsed)
+            if parts:
+                return cls._describe_stream_error(*parts)
+            inner = parsed.get("data")
+            if isinstance(inner, dict):
+                parts = cls._extract_stream_error_parts(inner)
+                if parts:
+                    return cls._describe_stream_error(*parts)
+            detail = str(
+                parsed.get("detail") or parsed.get("message") or ""
+            ).strip()
+            if detail:
+                code = str(parsed.get("code") or "").strip().upper()
+                return cls._describe_stream_error(code, detail)
+
+        # SSE lines: scan every data: frame for an error payload regardless of
+        # its declared type, in case GLM introduces new frame wrappers.
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:") :].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data_str)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            candidates = [payload]
+            inner = payload.get("data")
+            if isinstance(inner, dict):
+                candidates.append(inner)
+            for candidate in candidates:
+                parts = cls._extract_stream_error_parts(candidate)
+                if parts:
+                    code, detail = parts
+                    if code or detail:
+                        return cls._describe_stream_error(code, detail)
+        return None
+
     async def _send_message(
         self, timeout: int | None = None, arm_event: asyncio.Event | None = None
     ) -> None:
@@ -3139,6 +3405,7 @@ class GLMDriver(BaseDriver):
         cdp_stream_started = False
         cdp_stream_finished = False
         cdp_had_data = False
+        cdp_setup_done = asyncio.Event()
 
         def get_intercepted_activity_count() -> int:
             return intercepted_activity_count
@@ -3296,10 +3563,13 @@ class GLMDriver(BaseDriver):
         answer_emitted = False
         glm_block_active = False
         emitted_openai_chunk = False
+        content_emitted = False
         openai_usage: dict[str, Any] | None = None
         openai_usage_emitted = False
         openai_finish_emitted = False
         capacity_error_message: str | None = None
+        stream_error_message: str | None = None
+        stream_error_code: str | None = None
 
         try:
             count_tokens_setting = self.config_manager.get_setting("glm_behavior", "count_tokens")
@@ -3356,7 +3626,7 @@ class GLMDriver(BaseDriver):
             return usage
 
         def enqueue_openai_delta(content: str, finish_reason: str | None = None) -> None:
-            nonlocal emitted_openai_chunk
+            nonlocal emitted_openai_chunk, content_emitted
             if (not content) and (not finish_reason):
                 return
             model_name = self.current_model or "glm-auto"
@@ -3368,6 +3638,8 @@ class GLMDriver(BaseDriver):
                 )
             )
             emitted_openai_chunk = True
+            if content:
+                content_emitted = True
 
         def enqueue_openai_usage(usage: dict[str, Any]) -> None:
             nonlocal emitted_openai_chunk, openai_usage_emitted
@@ -3382,6 +3654,7 @@ class GLMDriver(BaseDriver):
         def process_sse_line(line: str) -> None:
             nonlocal thinking_emitted, answer_emitted, glm_block_active, openai_usage
             nonlocal openai_finish_emitted, capacity_error_message
+            nonlocal stream_error_message, stream_error_code
             line = line.strip()
             if not line.startswith("data:"):
                 return
@@ -3409,6 +3682,13 @@ class GLMDriver(BaseDriver):
 
             capacity_error_message = self._extract_model_capacity_error_from_data(data)
             if capacity_error_message:
+                return
+
+            error_parts = self._extract_stream_error_parts(data)
+            if error_parts:
+                code, detail = error_parts
+                stream_error_code = code or None
+                stream_error_message = self._describe_stream_error(code, detail)
                 return
 
             phase = str(data.get("phase") or "").strip().lower()
@@ -3509,7 +3789,7 @@ class GLMDriver(BaseDriver):
 
             intercepted_activity_count += 1
             full_response_body.extend(chunk)
-            if capacity_error_message:
+            if capacity_error_message or stream_error_message:
                 return
 
             text_buffer.extend(chunk)
@@ -3525,7 +3805,7 @@ class GLMDriver(BaseDriver):
                     process_sse_line(bytes(line_bytes).decode("utf-8", errors="ignore"))
                 except Exception:
                     continue
-                if capacity_error_message:
+                if capacity_error_message or stream_error_message:
                     break
 
             if text_buffer_pos > 8192:
@@ -3534,7 +3814,7 @@ class GLMDriver(BaseDriver):
 
         def finalize_glm_stream_processing(*, aborted: bool = False) -> None:
             nonlocal text_buffer_pos
-            if not capacity_error_message:
+            if not capacity_error_message and not stream_error_message:
                 tail = bytes(text_buffer[text_buffer_pos:])
                 if tail.strip():
                     try:
@@ -3548,6 +3828,7 @@ class GLMDriver(BaseDriver):
                 (not aborted)
                 and (not request_aborted())
                 and (not capacity_error_message)
+                and (not stream_error_message)
                 and count_tokens_enabled
                 and (openai_usage is not None)
                 and (not openai_usage_emitted)
@@ -3567,7 +3848,8 @@ class GLMDriver(BaseDriver):
                 and (not encountered_error)
                 and (not request_aborted())
                 and (not capacity_error_message)
-                and (not emitted_openai_chunk)
+                and (not stream_error_message)
+                and (not content_emitted)
             )
 
             if capacity_error_message:
@@ -3576,26 +3858,67 @@ class GLMDriver(BaseDriver):
                 response_queue.put_nowait(
                     f"data: {json.dumps({'error': capacity_error_message})}\n\n"
                 )
-            elif should_report_empty_stream_error:
-                msg = self._extract_model_capacity_error_from_text(
-                    full_response_body.decode("utf-8", errors="ignore")
+            elif stream_error_message:
+                Logger.warning(stream_error_message)
+                if stream_error_code in self.CAPTCHA_ERROR_CODES:
+                    self.notify_user(
+                        "GLM Chat Verification Required",
+                        "GLM Chat is asking for a CAPTCHA. Solve it in the GLM Chat "
+                        "browser window, then retry the request.",
+                        level="warning",
+                    )
+                    if not self.abort_requested and not (abort_event and abort_event.is_set()):
+                        await self._reload_chat_page("CAPTCHA verification required")
+                response_queue.put_nowait(
+                    f"data: {json.dumps({'error': stream_error_message})}\n\n"
                 )
+            elif should_report_empty_stream_error:
+                body_text = full_response_body.decode("utf-8", errors="ignore")
+                msg = self._extract_model_capacity_error_from_text(body_text)
                 if msg:
                     await self._refresh_page_after_capacity_error()
                 if not msg:
+                    msg = self._extract_stream_error_from_text(body_text)
+                captcha_recent = (time.time() - getattr(self, "_last_captcha_notice_ts", 0.0)) < 90.0
+                if not msg:
                     if self._glm_frontend_would_see_sse_data_event(full_response_body):
-                        # Surface a helpful error instead of silently returning an empty stream.
-                        msg = (
-                            "GLM Chat: intercepted completion produced no streamable output. "
-                            "This may indicate a GLM API / frontend change."
-                        )
+                        # SSE frames arrived but nothing was streamable. If the
+                        # frames carry no content fields at all, this matches
+                        # GLM's silent-refusal signature exactly (a lone
+                        # phase:"done" frame) - surface moderation, not an API
+                        # change warning.
+                        if (
+                            "delta_content" not in body_text
+                            and "edit_content" not in body_text
+                            and "content" not in body_text
+                        ):
+                            msg = (
+                                "GLM Chat silently refused this prompt - the server "
+                                "returned no content (shadow censorship). Try "
+                                "rephrasing the prompt or trimming the conversation "
+                                "history."
+                            )
+                        else:
+                            msg = (
+                                "GLM Chat: intercepted completion produced no streamable output. "
+                                "This may indicate a GLM API / frontend change."
+                            )
                     else:
                         msg = self._build_empty_completion_stream_error_message()
+                        if captcha_recent:
+                            msg += (
+                                " FeiLin CAPTCHA activity was detected during this request - "
+                                "check the GLM browser window for a verification popup."
+                            )
                         await self._reload_chat_page(
                             "empty completion stream "
                             f"(GLM Error code: {self.EMPTY_COMPLETION_STREAM_ERROR_CODE})"
                         )
                 Logger.warning(msg)
+                Logger.debug(
+                    "GLM Chat: raw completion body head for diagnosis: "
+                    + repr(body_text[:800])
+                )
                 response_queue.put_nowait(f"data: {json.dumps({'error': msg})}\n\n")
 
             await response_queue.put(None)
@@ -3605,8 +3928,15 @@ class GLMDriver(BaseDriver):
                 and (not encountered_error)
                 and (not request_aborted())
                 and (not capacity_error_message)
+                and (not stream_error_message)
             ):
-                Logger.success("GLM Chat response streaming completed.")
+                if content_emitted:
+                    Logger.success("GLM Chat response streaming completed.")
+                else:
+                    Logger.warning(
+                        "GLM Chat: completion finished without any streamable content "
+                        "(metadata-only response - likely a silent refusal)."
+                    )
 
         async def handle_route(route):
             nonlocal completion_claimed, intercepted_response
@@ -3684,10 +4014,10 @@ class GLMDriver(BaseDriver):
                                 break
 
                             process_glm_stream_chunk(chunk)
-                            if capacity_error_message:
+                            if capacity_error_message or stream_error_message:
                                 break
 
-                        if not capacity_error_message:
+                        if not capacity_error_message and not stream_error_message:
                             finalize_glm_stream_processing(aborted=aborted)
                 except httpx.ReadError as e:
                     if not aborted and not request_aborted():
@@ -3757,6 +4087,17 @@ class GLMDriver(BaseDriver):
             if request_id != cdp_active_request_id or cdp_stream_finished:
                 return
 
+            # Don't finalize while stream setup (or body recovery) is still in
+            # flight - otherwise loadingFinished could race ahead and drop the
+            # first buffered chunk.
+            if not cdp_setup_done.is_set():
+                try:
+                    await asyncio.wait_for(cdp_setup_done.wait(), timeout=5.0)
+                except Exception:
+                    pass
+                if request_id != cdp_active_request_id or cdp_stream_finished:
+                    return
+
             cdp_stream_finished = True
             if not aborted and not encountered_error:
                 finalize_glm_stream_processing(aborted=False)
@@ -3805,20 +4146,70 @@ class GLMDriver(BaseDriver):
             cdp_stream_started = True
             Logger.info("Teeing GLM Chat API response via CDP...")
             Logger.debug(f"Teeing request to: {url}")
-            try:
-                result = await cdp_session.send(
-                    "Network.streamResourceContent",
-                    {"requestId": request_id},
-                )
-            except Exception as exc:
-                message_text = f"GLM Chat CDP response streaming failed: {exc}"
-                Logger.error(message_text)
-                await response_queue.put({"error": message_text})
-                await finish_cdp_stream(request_id, encountered_error=True)
-                return
 
-            if isinstance(result, dict):
-                await feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+            async def recover_finished_cdp_body() -> None:
+                # Fast-failing responses (moderation/captcha refusals) can finish
+                # loading before we attach streaming. Recover the buffered body so
+                # the real error reaches the client instead of an empty stream.
+                Logger.debug(
+                    "GLM Chat CDP: response finished before streaming attached; "
+                    "recovering buffered body..."
+                )
+                try:
+                    result = await cdp_session.send(
+                        "Network.getResponseBody",
+                        {"requestId": request_id},
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"body recovery failed: {exc}") from exc
+
+                if isinstance(result, dict):
+                    if result.get("base64Encoded"):
+                        encoded_text = str(result.get("body") or "")
+                        try:
+                            recovered = base64.b64decode(encoded_text, validate=True)
+                        except Exception:
+                            recovered = encoded_text.encode("utf-8", errors="ignore")
+                        Logger.debug(
+                            "GLM Chat CDP: recovered buffered body "
+                            f"({len(recovered)} bytes, base64)."
+                        )
+                        await feed_cdp_stream_chunk(request_id, recovered)
+                    else:
+                        body_text = str(result.get("body") or "")
+                        Logger.debug(
+                            "GLM Chat CDP: recovered buffered body "
+                            f"({len(body_text)} chars, text)."
+                        )
+                        await feed_cdp_stream_chunk(
+                            request_id,
+                            body_text.encode("utf-8", errors="ignore"),
+                        )
+
+            fatal_message: str | None = None
+            try:
+                try:
+                    result = await cdp_session.send(
+                        "Network.streamResourceContent",
+                        {"requestId": request_id},
+                    )
+                except Exception as exc:
+                    if "already finished loading" in str(exc):
+                        await recover_finished_cdp_body()
+                        return
+                    raise
+
+                if isinstance(result, dict):
+                    await feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+            except Exception as exc:
+                fatal_message = f"GLM Chat CDP response streaming failed: {exc}"
+            finally:
+                cdp_setup_done.set()
+
+            if fatal_message:
+                Logger.error(fatal_message)
+                await response_queue.put({"error": fatal_message})
+                await finish_cdp_stream(request_id, encountered_error=True)
 
         async def handle_cdp_request_will_be_sent(params: Any) -> None:
             nonlocal completion_claimed, cdp_active_request_id
