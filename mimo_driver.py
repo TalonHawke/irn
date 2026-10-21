@@ -862,10 +862,10 @@ class MimoDriver(BaseDriver):
         return override or self._get_configured_model_label()
 
     async def apply_configured_model(self, model: Any = None) -> None:
-        desired = self._get_model_label_for_request(model)
-        if not desired:
-            return
-        await self._ensure_mimo_model_selected(desired)
+        # Model selection is disabled: the MiMo site's model dropdown changed and
+        # the automated clicks looped. Use whatever model is selected in the UI.
+        Logger.debug("MiMo: model selection skipped; using the model selected in the UI.")
+        return
 
     async def _read_current_mimo_model_label(self) -> str:
         if not self.page:
