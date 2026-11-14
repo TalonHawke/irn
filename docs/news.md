@@ -8,6 +8,41 @@ icon: material/newspaper-variant-outline
 
 This page is the changelog for the latest news and updates about IntenseRP Next.
 
+## September 17, 2026 - Update 2.9.3
+
+A provider-fix follow-up with **Kimi K2.8** as its own picker model, **DeepSeek's new radio picker**, and a **GLM Chat** modal-overlay fix.
+
+**Kimi (Moonshot):** Kimi introduced a new **K2.8** model that is a separate entry in the web picker (a tier-gated preview on some accounts) - not a rename of the classic Instant model. IntenseRP now treats it as its own model: `Instant` always selects the **Instant** entry and K2.8 always selects the **K2.8** entry (also matched via `K2.8 Preview` / `Kimi K2.8` labels), and K2.8 appears in the Model dropdown. With Universal Model Names enabled it exposes `k2-8-auto` / `k2-8-chat` / `k2-8-reasoner` API model IDs just like the other Kimi families.
+
+**DeepSeek:** DeepSeek is rolling out a new radio-style model type picker, and its `data-model-type` value for the fast/default ("Instant") option varies between rollouts. IntenseRP now matches the Instant option across those values (`default`, `instant`, `instant-v3`) on both the new radio picker and the legacy inline picker.
+
+**GLM Chat:** z.ai's app can now render a dialog modal overlay (`data-dialog-overlay`) on top of the sidebar after startup; that overlay was intercepting clicks on the **New Chat** button. IntenseRP dismisses dialog-style overlays (Escape-key and close-button cleanup) before clicking New Chat, and **GLM-5.3-Flash** joins the GLM model list.
+
+[GLM Behavior](providers/glm-behavior.md){ .md-button }
+[GLM Quirks](advanced/glm-quirks.md){ .md-button }
+[Moonshot Behavior](providers/moonshot-behavior.md){ .md-button }
+
+---
+
+## August 22, 2026 - Update 2.9.2
+
+This release is a big catch-up for two providers whose web apps moved under our feet: **GLM Chat (z.ai)** and **Moonshot Kimi (kimi.ai)**.
+
+**GLM Chat works again** after z.ai moved its completion endpoint - IntenseRP now accepts both the old and new paths - and **GLM-5.3** is supported and selected by default, including its Deep Think effort menu (`glm-5-3-auto` / `glm-5-3-reasoner` / `glm-5-3-chat` API model IDs). GLM failures are honest now: structured refusals (`SENSITIVE`, `RISK_CONTROL_BLOCKED`, CAPTCHA codes, generic errors) are logged with their codes and forwarded to your client as proper error events, with a desktop notification when a FeiLin CAPTCHA needs solving in the browser window. Metadata-only "silent refusals" are reported as probable shadow censorship instead of masquerading as success, and CDP Teeing recovers fast-failing response bodies automatically instead of losing them.
+
+**Kimi moved international accounts to kimi.ai**, so IntenseRP follows along: new sessions start on kimi.ai, a **Kimi Site Region** switch covers accounts on either domain, and the model picker gained real support for the K3 generation with label-tolerant matching. With Universal Model Names enabled, Kimi now exposes split API model IDs just like GLM: `kimi-k3-auto`, `kimi-k3-chat`, `kimi-k3-reasoner`, plus `instant-*` and `kimi-k3-swarm-*` variants, alongside the classic `moonshot-auto/chat/reasoner`. The `-reasoner` suffix forwards reasoning where the model produces it; `-chat` strips it.
+
+Kimi's aggressive rate limiting ("Too many people are chatting with Kimi right now") is detected from stream content and HTTP 429/503 responses and surfaced as an at-capacity error to your client instead of silence. The removed Search toolkit menu is handled through Kimi's new Offline Mode switch where present, and skipped cleanly on models that don't render it.
+
+Smaller goodies across both providers: FeiLin's console-wiping anti-debug trick is neutralized so DevTools logs survive challenges, CAPTCHA resource loading is observed and logged, UI reads use bounded timeouts so provider stalls can't freeze requests, and the API worker closes driver generators deterministically (no more `GeneratorExit` noise on retries).
+
+[Join our Discord](https://discord.gg/4Gvjk2RdsK){ .md-button }
+[GLM Behavior](providers/glm-behavior.md){ .md-button }
+[GLM Quirks](advanced/glm-quirks.md){ .md-button }
+[Moonshot Behavior](providers/moonshot-behavior.md){ .md-button }
+
+---
+
 ## July 4, 2026 - Update 2.9.0
 
 IntenseRP Next v2.9.0 is here, and this one is a little special: **IntenseRP Next is turning 1 year old this July**!!! 🎆🎆🎆✨✨✨
