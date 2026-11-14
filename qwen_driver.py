@@ -625,6 +625,11 @@ class QwenLMDriver(BaseDriver):
         if not self.page:
             raise RuntimeError("Page is not initialized.")
 
+        # Login detection is intentionally skipped: the user signs in manually in the
+        # browser window. Everything below this return is currently unreachable.
+        Logger.info("QwenLM: skipping login detection, assuming you're already signed in.")
+        return
+
         try:
             if await self._has_token_cookie():
                 Logger.info("QwenLM: already signed in.")
@@ -939,13 +944,7 @@ class QwenLMDriver(BaseDriver):
             Logger.warning(f"Multi-Slot Cache (QwenLM): chat shell did not become ready: {e}")
             return False
 
-        try:
-            if not await self._has_token_cookie():
-                Logger.warning("Multi-Slot Cache (QwenLM): cached chat URL is not available for the active session.")
-                return False
-        except Exception:
-            pass
-
+        # Cookie check removed along with login detection (see login()).
         return True
 
     async def _open_new_chat_route(self) -> bool:
