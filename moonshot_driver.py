@@ -34,6 +34,8 @@ load_dotenv()
 
 
 class MoonshotDriver(BaseDriver):
+    KIMI_BASE_URL = "https://www.kimi.ai"
+    KIMI_HOSTS = {"www.kimi.ai", "kimi.ai", "www.kimi.com", "kimi.com"}
     REQUEST_CAPTURE_MODE_REPLAY = "replay"
     REQUEST_CAPTURE_MODE_CDP_TEEING = "cdp_teeing"
     CHAT_ROUTE_GLOB = "**/apiv2/kimi.gateway.chat.v1.ChatService/Chat*"
@@ -43,8 +45,8 @@ class MoonshotDriver(BaseDriver):
         "/apiv2/kimi.gateway.chat.v1.ChatService/RegenerateMessage",
     )
     USER_SETTINGS_ROUTE_GLOB = "**/apiv2/kimi.usersetting.v1.UserSettingService/GetUserSetting*"
-    USER_SETTINGS_UPDATE_URL = "https://www.kimi.com/apiv2/kimi.usersetting.v1.UserSettingService/UpdateUserSetting"
-    NEW_CHAT_URL = "https://www.kimi.com/?chat_enter_method=new_chat"
+    USER_SETTINGS_UPDATE_URL = f"{KIMI_BASE_URL}/apiv2/kimi.usersetting.v1.UserSettingService/UpdateUserSetting"
+    NEW_CHAT_URL = f"{KIMI_BASE_URL}/?chat_enter_method=new_chat"
     AUTH_HOST_MARKER = "accounts.google.com"
     MEMORY_DISABLE_UPDATE_PAYLOAD = {
         "user_setting": {"memory": {}},
@@ -116,7 +118,7 @@ class MoonshotDriver(BaseDriver):
         self._last_followup_request_headers: Dict[str, str] = {}
 
     def get_start_url(self) -> str:
-        return "https://www.kimi.com/"
+        return self.KIMI_BASE_URL + "/"
 
     async def before_initial_navigation(self) -> None:
         if not self.page:
@@ -339,7 +341,7 @@ class MoonshotDriver(BaseDriver):
                                 const resp = await fetch(request.url, {
                                     method: request.method || "POST",
                                     credentials: "include",
-                                    referrer: request.referrer || "https://www.kimi.com/settings",
+                                    referrer: request.referrer || "https://www.kimi.ai/settings",
                                     headers: {
                                         ...(request.headers || {}),
                                         "content-type": "application/json",
@@ -1204,6 +1206,11 @@ class MoonshotDriver(BaseDriver):
         if not self.page:
             return
 
+        # Login detection is intentionally skipped: the user signs in manually in the
+        # browser window. Everything below this return is currently unreachable.
+        Logger.info("Moonshot: skipping login detection, assuming you're already signed in.")
+        return
+
         settled_auth_state = await self._wait_for_auth_state(timeout_ms=self.AUTH_STATE_SETTLE_TIMEOUT_MS)
         if settled_auth_state == "signed_in":
             Logger.info("Moonshot: already signed in.")
@@ -1428,7 +1435,7 @@ class MoonshotDriver(BaseDriver):
             return None
 
         hostname = str(parsed.netloc or "").strip().lower()
-        if hostname not in {"www.kimi.com", "kimi.com"}:
+        if hostname not in self.KIMI_HOSTS:
             return None
 
         path_parts = [part for part in str(parsed.path or "").split("/") if part]
@@ -1441,7 +1448,7 @@ class MoonshotDriver(BaseDriver):
 
         return {
             "conversation_id": conversation_id,
-            "conversation_url": f"https://www.kimi.com/chat/{conversation_id}",
+            "conversation_url": f"{self.KIMI_BASE_URL}/chat/{conversation_id}",
         }
 
     async def _get_current_conversation_info(self) -> Optional[Dict[str, str]]:
@@ -1488,13 +1495,13 @@ class MoonshotDriver(BaseDriver):
         headers = dict(getattr(self, "_last_followup_request_headers", {}) or {})
         headers.setdefault("accept", "application/json, text/plain, */*")
         headers.setdefault("content-type", "application/json")
-        headers.setdefault("origin", "https://www.kimi.com")
-        headers.setdefault("referer", "https://www.kimi.com/")
+        headers.setdefault("origin", self.KIMI_BASE_URL)
+        headers.setdefault("referer", self.KIMI_BASE_URL + "/")
 
         try:
             client = await self._get_http_client()
             response = await client.post(
-                "https://www.kimi.com/apiv2/kimi.chat.v1.ChatService/DeleteChat",
+                f"{self.KIMI_BASE_URL}/apiv2/kimi.chat.v1.ChatService/DeleteChat",
                 headers=headers,
                 cookies=cookies,
                 json={"chat_id": normalized_id},
@@ -1555,10 +1562,7 @@ class MoonshotDriver(BaseDriver):
             Logger.warning(f"Multi-Slot Cache (Moonshot): failed to open cached chat URL: {e}")
             return False
 
-        auth_state = await self._wait_for_auth_state(timeout_ms=self.AUTH_STATE_SETTLE_TIMEOUT_MS)
-        if auth_state == "signed_out":
-            Logger.warning("Multi-Slot Cache (Moonshot): cached chat URL is not available for the active session.")
-            return False
+        # Auth check removed along with login detection (see login()).
 
         editor = await self._find_first_visible(
             [
@@ -2706,6 +2710,13 @@ class MoonshotDriver(BaseDriver):
         return False
 
     async def set_deepthink_state(self, state: bool):
+        # Model/Thinking selection is manual: pick it yourself in the browser window.
+        # The original picker-driving code below this return is intentionally unreachable.
+        if not getattr(self, "_manual_model_notice_logged", False):
+            self._manual_model_notice_logged = True
+            Logger.info("Moonshot: model/Thinking selection is manual; skipping automatic model switch.")
+        return
+
         current = await self._read_current_model_name()
         current_norm = self._normalize_text(current)
         instant_norm = self._normalize_text(self.MODEL_INSTANT)
@@ -3137,10 +3148,7 @@ class MoonshotDriver(BaseDriver):
             Logger.warning(f"Moonshot: failed to open New Chat URL: {e}")
             return
 
-        auth_state = await self._wait_for_auth_state(timeout_ms=self.AUTH_STATE_SETTLE_TIMEOUT_MS)
-        if auth_state == "signed_out":
-            Logger.warning("Moonshot: New Chat URL is not available for the active session.")
-            return
+        # Auth check removed along with login detection (see login()).
 
         await self.set_sidebar_status(open=False)
 
